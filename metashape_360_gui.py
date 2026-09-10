@@ -754,7 +754,7 @@ class Metashape360GUI:
                 )
             cmd = [str(cli_exe)]
         else:
-            script_path = self.get_app_base_dir() / "metashape_360_to_colmap.py"
+            script_path = self.get_app_base_dir() / "metashape_360_to_colmap_lichtfeld.py"
             # Use unbuffered mode so stdout/stderr is streamed to the GUI log in real time.
             cmd = [sys.executable, "-u", str(script_path)]
         
