@@ -1,126 +1,104 @@
 #!/usr/bin/env python3
 """Metashape 360 -> COLMAP converter with LichtFeld axis conversion.
 
-This entry point intentionally leaves the upstream converter unchanged. It:
-1. runs ``metashape_360_to_colmap.py`` with the supplied arguments;
-2. applies the tested global axis conversion to the generated COLMAP scene:
-       X' = X, Y' = -Y, Z' = -Z
-   and the equivalent W2C pose rotation:
-       R'_w2c = R_w2c @ diag(1,-1,-1)
+This wrapper deliberately keeps the vanilla converter as the single source of
+truth for conversion. Every vanilla CLI argument is passed through unchanged.
+After vanilla finishes, the generated COLMAP scene is adapted for LichtFeld
+with the tested global world-axis conversion:
+
+    X' = X
+    Y' = -Y
+    Z' = -Z
+
+For COLMAP world-to-camera poses:
+
+    R'_w2c = R_w2c @ diag(1,-1,-1)
 
 Images and masks are not modified.
-
-Usage:
-    python metashape_360_to_colmap_lichtfeld.py \
-        --images ./equirect \
-        --xml ./cameras.xml \
-        --output ./colmap_dataset \
-        --ply ./dense.ply
-
-All converter options are accepted and passed through to the vanilla script.
 """
 
 from __future__ import annotations
 
 import argparse
-import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-from lichtfeld_axis import transform_colmap_images_txt, transform_points3d_txt, transform_ply_xyz
+import numpy as np
+
+from lichtfeld_axis import transform_colmap_images_txt, transform_points3d_txt
 
 
 THIS_DIR = Path(__file__).resolve().parent
 VANILLA = THIS_DIR / "metashape_360_to_colmap.py"
 
 
-def build_parser() -> argparse.ArgumentParser:
+def parse_wrapper_args() -> tuple[Path, bool, list[str]]:
+    """Extract only wrapper-specific arguments.
+
+    All other arguments are forwarded byte-for-byte to vanilla. This prevents
+    the adapter from drifting when the upstream CLI gains or changes options.
+    """
     parser = argparse.ArgumentParser(
-        description="Run the vanilla Metashape 360 -> COLMAP converter and adapt the result for LichtFeld."
+        description="Run vanilla Metashape 360 -> COLMAP and adapt the result for LichtFeld."
     )
-    parser.add_argument("--images", type=Path, required=True)
-    parser.add_argument("--xml", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--ply", type=Path)
-    parser.add_argument("--crop-size", type=int, default=1920)
-    parser.add_argument("--fov-deg", type=float, default=90.0)
-    parser.add_argument("--flip-vertical", action="store_true", default=True)
-    parser.add_argument("--no-flip-vertical", action="store_false", dest="flip_vertical")
-    parser.add_argument("--max-images", type=int, default=10000)
-    parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--apply-component-transform-for-ply", action="store_true")
-    parser.add_argument("--skip-directions", type=str, default="")
-    parser.add_argument("--generate-masks", action="store_true")
-    parser.add_argument("--external-masks", type=Path)
-    parser.add_argument("--yolo-model", type=str, default="yolo11n-seg.pt")
-    parser.add_argument("--yolo-classes", type=str, default="0")
-    parser.add_argument("--yolo-conf", type=float, default=0.25)
-    parser.add_argument("--invert-mask", action="store_true")
-    parser.add_argument("--yaw-offset", type=float, default=0.0)
-    parser.add_argument("--rotate-z180", action="store_true", default=True)
-    parser.add_argument("--no-rotate-z180", action="store_false", dest="rotate_z180")
-    parser.add_argument("--range-images", type=str)
-    parser.add_argument("--mask-overexposure", action="store_true")
-    parser.add_argument("--overexposure-threshold", type=int, default=250)
-    parser.add_argument("--overexposure-dilate", type=int, default=5)
-    parser.add_argument("--output-format", choices=["auto", "jpg", "jpeg", "png", "tiff", "tif", "webp"], default="auto")
-    parser.add_argument("--quiet", action="store_true")
     parser.add_argument(
         "--no-lichtfeld-axis",
         action="store_true",
         help="Run vanilla only; useful for A/B validation.",
     )
-    return parser
+
+    args, unknown = parser.parse_known_args()
+
+    # argparse consumes --output. Put it back so vanilla receives the exact
+    # same option. --no-lichtfeld-axis is wrapper-only and is not forwarded.
+    vanilla_args = list(unknown)
+    vanilla_args += ["--output", str(args.output)]
+
+    return args.output, args.no_lichtfeld_axis, vanilla_args
 
 
-def run_vanilla(args: argparse.Namespace) -> int:
-    cmd = [
-        sys.executable,
-        str(VANILLA),
-        "--images", str(args.images),
-        "--xml", str(args.xml),
-        "--output", str(args.output),
-        "--crop-size", str(args.crop_size),
-        "--fov-deg", str(args.fov_deg),
-        "--max-images", str(args.max_images),
-        "--num-workers", str(args.num_workers),
-        "--yolo-model", str(args.yolo_model),
-        "--yolo-classes", str(args.yolo_classes),
-        "--yolo-conf", str(args.yolo_conf),
-        "--yaw-offset", str(args.yaw_offset),
-        "--overexposure-threshold", str(args.overexposure_threshold),
-        "--overexposure-dilate", str(args.overexposure_dilate),
-        "--output-format", args.output_format,
-    ]
-
-    if args.flip_vertical:
-        cmd.append("--flip-vertical")
-    else:
-        cmd.append("--no-flip-vertical")
-
-    if args.apply_component_transform_for_ply:
-        cmd.append("--apply-component-transform-for-ply")
-    if args.skip_directions:
-        cmd += ["--skip-directions", args.skip_directions]
-    if args.generate_masks:
-        cmd.append("--generate-masks")
-    if args.external_masks:
-        cmd += ["--external-masks", str(args.external_masks)]
-    if args.invert_mask:
-        cmd.append("--invert-mask")
-    if args.rotate_z180:
-        cmd.append("--rotate-z180")
-    else:
-        cmd.append("--no-rotate-z180")
-    if args.range_images:
-        cmd += ["--range-images", args.range_images]
-    if args.mask_overexposure:
-        cmd.append("--mask-overexposure")
-    if args.quiet:
-        cmd.append("--quiet")
-
+def run_vanilla(vanilla_args: list[str]) -> int:
+    cmd = [sys.executable, str(VANILLA), *vanilla_args]
+    print("Running vanilla converter:")
+    print(" ".join(cmd))
+    print()
     return subprocess.call(cmd, cwd=str(THIS_DIR))
+
+
+def transform_ply_with_open3d(ply: Path) -> int:
+    """Apply X,Y,Z -> X,-Y,-Z to the vanilla-generated PLY.
+
+    Vanilla writes the PLY through Open3D and normally produces a binary PLY.
+    Therefore the old ASCII-only helper was not suitable here. We use Open3D
+    to read/write the point cloud, preserving its point attributes such as
+    colors.
+    """
+    try:
+        import open3d as o3d
+    except ImportError as exc:
+        raise RuntimeError("Open3D is required to transform points3D.ply") from exc
+
+    pc = o3d.io.read_point_cloud(str(ply))
+    points = np.asarray(pc.points)
+    if points.size == 0:
+        raise RuntimeError(f"Open3D loaded zero points from {ply}")
+
+    points = points.copy()
+    points[:, 1] *= -1.0
+    points[:, 2] *= -1.0
+    pc.points = o3d.utility.Vector3dVector(points)
+
+    backup = ply.with_suffix(ply.suffix + ".vanilla")
+    if not backup.exists():
+        import shutil
+        shutil.copy2(ply, backup)
+
+    if not o3d.io.write_point_cloud(str(ply), pc):
+        raise RuntimeError(f"Failed to write transformed PLY: {ply}")
+
+    return len(points)
 
 
 def apply_lichtfeld_conversion(output_dir: Path, quiet: bool = False) -> None:
@@ -139,29 +117,24 @@ def apply_lichtfeld_conversion(output_dir: Path, quiet: bool = False) -> None:
             print(f"LichtFeld axis: transformed {n} points in {points_txt}")
 
     if ply.exists():
-        # The vanilla converter writes this PLY with Open3D. Instead of parsing
-        # binary data here, make a backup and leave the generated PLY untouched.
-        # points3D.txt is the COLMAP point representation used by the dataset.
-        backup = ply.with_suffix(ply.suffix + ".vanilla")
-        if not backup.exists():
-            shutil.copy2(ply, backup)
+        n = transform_ply_with_open3d(ply)
         if not quiet:
-            print(f"LichtFeld axis: left binary PLY unchanged (backup: {backup.name})")
+            print(f"LichtFeld axis: transformed {n} points in {ply}")
 
 
 def main() -> int:
-    args = build_parser().parse_args()
+    output_dir, no_axis, vanilla_args = parse_wrapper_args()
 
     if not VANILLA.is_file():
         print(f"Error: vanilla converter not found: {VANILLA}")
         return 1
 
-    code = run_vanilla(args)
+    code = run_vanilla(vanilla_args)
     if code != 0:
         return code
 
-    if not args.no_lichtfeld_axis:
-        apply_lichtfeld_conversion(args.output, quiet=args.quiet)
+    if not no_axis:
+        apply_lichtfeld_conversion(output_dir)
 
     return 0
 
